@@ -20,9 +20,14 @@ const events = require('events');
 const { spawnSync } = require('child_process');
 const { solvePOW } = require('./lib/pow');
 const { loadDotEnv } = require('./lib/env');
+const { createTracer } = require('./lib/trace');
 
 // Real environment variables always win over .env.
 if (require.main === module) loadDotEnv(path.join(__dirname, '.env'));
+
+// Two-way request tracing (client <-> proxy <-> DeepSeek). Off unless
+// DEEPSEEK_TRACE=1; see lib/trace.js for the record format.
+const TRACE = createTracer();
 
 function envNumber(name, fallback, min = 0) {
     const raw = process.env[name];
@@ -63,12 +68,29 @@ function throwIfAborted(signal) {
     if (signal?.aborted) throw signal.reason || new Error('request aborted');
 }
 
+// Trace payloads are JSON for every endpoint except image upload, which posts
+// multipart/form-data. Binary form bodies must never be stringified: record
+// their size instead so a trace stays readable and small.
+function describeUpstreamBody(body) {
+    if (body === undefined || body === null) return null;
+    if (typeof body === 'string') return body;
+    if (typeof FormData !== 'undefined' && body instanceof FormData) {
+        const parts = [];
+        for (const [name, value] of body.entries()) {
+            parts.push({ field: name, size: typeof value === 'string' ? Buffer.byteLength(value, 'utf8') : Number(value?.size || 0) });
+        }
+        return { multipart: true, parts };
+    }
+    return String(body);
+}
+
 // Short JSON request (PoW, session create): bounded by DS_FETCH_TIMEOUT_MS
 // including the body, and cancelled together with the inbound request.
 function dsFetch(url, options = {}, timeoutMs = DS_FETCH_TIMEOUT_MS) {
     const controller = new AbortController();
     followSignal(controller, options.signal);
     followSignal(controller, AbortSignal.timeout(timeoutMs));
+    TRACE.upstreamRequest({ url, method: options.method || 'GET', payload: describeUpstreamBody(options.body) });
     return fetch(url, { ...options, signal: controller.signal });
 }
 
@@ -80,8 +102,16 @@ async function dsFetchStream(url, options = {}) {
     followSignal(controller, options.signal);
     const connectTimer = setTimeout(() => controller.abort(timeoutError(`DeepSeek did not respond within ${DS_FETCH_TIMEOUT_MS}ms`)), DS_FETCH_TIMEOUT_MS);
     try {
+        TRACE.upstreamRequest({ url, method: options.method || 'POST', payload: describeUpstreamBody(options.body) });
         const resp = await fetch(url, { ...options, signal: controller.signal });
         resp.abortController = controller;
+        // Only the head is known here; the body is SSE and is traced event by
+        // event by readDeepSeekResponse.
+        TRACE.upstreamResponse({
+            status: resp.status,
+            headers: { 'content-type': resp.headers.get('content-type'), 'retry-after': resp.headers.get('retry-after') },
+            body: { stream: true, url },
+        });
         return resp;
     } finally {
         clearTimeout(connectTimer);
@@ -1942,8 +1972,10 @@ function toResponsesResponse(openaiResp, ids = {}) {
 
 function sendJsonError(res, status, message, type, extra = {}, headers = {}) {
     if (res.headersSent) { if (!res.writableEnded) res.end(); return; }
+    const payload = { error: { message, type, ...extra } };
+    TRACE.outboundHttp({ status, body: payload });
     res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
-    res.end(JSON.stringify({ error: { message, type, ...extra } }));
+    res.end(JSON.stringify(payload));
 }
 
 function sendCompletion(res, apiMode, stream, openaiResponse) {
@@ -1953,13 +1985,16 @@ function sendCompletion(res, apiMode, stream, openaiResponse) {
         else sendOpenAIStream(res, openaiResponse);
         return;
     }
+    const payload = apiMode === 'anthropic'
+        ? toAnthropicResponse(openaiResponse)
+        : (apiMode === 'responses' ? toResponsesResponse(openaiResponse) : openaiResponse);
+    TRACE.outboundHttp({ status: 200, body: payload });
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    if (apiMode === 'anthropic') res.end(JSON.stringify(toAnthropicResponse(openaiResponse)));
-    else if (apiMode === 'responses') res.end(JSON.stringify(toResponsesResponse(openaiResponse)));
-    else res.end(JSON.stringify(openaiResponse));
+    res.end(JSON.stringify(payload));
 }
 
 function writeSse(res, event, data) {
+    TRACE.sseOut(event, data);
     if (event) res.write(`event: ${event}\n`);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
@@ -2572,6 +2607,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    TRACE.inboundHttp({
+        method: req.method, url: url.pathname + url.search,
+        headers: req.headers, remote: req.socket.remoteAddress,
+        agent: req.headers['x-agent-session'],
+        apiMode: url.pathname === '/v1/messages' ? 'anthropic' : (url.pathname === '/v1/responses' ? 'responses' : 'openai'),
+    });
     const isPublicProbe = req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health' || url.pathname === '/readyz');
     if (!isPublicProbe && !isProxyAuthorized(req.headers.authorization, PROXY_API_KEY, req.headers['x-api-key'])) {
         res.writeHead(401, {
@@ -2704,6 +2745,7 @@ const server = http.createServer(async (req, res) => {
     req.on('end', async () => {
         if (bodyTooLarge) return;
         const body = Buffer.concat(bodyChunks).toString('utf8');
+        TRACE.inboundBody(body);
         inFlight++;
         let clientGone = false;
         // Cancels every upstream call of this request (PoW, chat creation,
@@ -2935,6 +2977,7 @@ const server = http.createServer(async (req, res) => {
                     let d;
                     try { d = JSON.parse(payload); } catch (e) { return; }
                     if (!d || typeof d !== 'object') return;
+                    TRACE.upstreamEvent({ kind: 'sse', data: d });
                     if (d.response_message_id !== undefined && !newMessageId) newMessageId = d.response_message_id;
                     if (isDeepSeekModelErrorEvent(d)) {
                         modelError = { type: d.type || 'error', content: d.content || '', finish_reason: d.finish_reason || null };

@@ -43,6 +43,7 @@ ForgetMeAI: https://t.me/forgetmeai
 - [Diagnostics / doctor](#-diagnostics--doctor)
 - [Session reuse и сброс чатов](#-session-reuse-и-сброс-чатов)
 - [Multi-account pool](#-multi-account-pool)
+- [Трассировка запросов](#-трассировка-запросов-двусторонняя)
 - [Идеи для консольной авторизации](#-идеи-для-консольной-авторизации)
 - [Проверка работы](#-проверка-работы)
 - [Примеры запросов](#-примеры-запросов)
@@ -701,6 +702,34 @@ curl http://localhost:9655/v1/model-capabilities
 | `GET` | `/v1/sessions` | активные локальные agent sessions |
 | `POST` | `/reset-session?agent=<id>` | сбросить одну session |
 | `POST` | `/reset-session?agent=all` | сбросить все sessions |
+
+---
+
+##  Трассировка запросов (двусторонняя)
+
+По умолчанию трассировка выключена. Включите её, чтобы видеть весь обмен:
+
+```bash
+DEEPSEEK_TRACE=1 DEEPSEEK_TRACE_FILE=logs/trace.jsonl npm start
+```
+
+При включении в лог попадают все четыре направления:
+
+| Направление | Что пишется |
+| --- | --- |
+| `client->proxy` | метод, путь, заголовки (секреты вырезаны), тело запроса — включая `/v1/messages` от Claude Code |
+| `proxy->client` | JSON-ответ целиком или каждый SSE-евент, отправленный клиенту |
+| `proxy->deepseek` | URL, `model_type`, `chat_session_id` и полный prompt, уходящий в DeepSeek Web |
+| `deepseek->proxy` | статус ответа и каждое SSE-событие от DeepSeek (`p`/`v`, фрагменты, `finish_reason`) |
+
+- В консоль записи идут с префиксом `[TRACE]`; с `DEEPSEEK_TRACE_FILE` те же
+  записи дописываются в файл как JSONL (по одной на строку).
+- Тела обрезаются до `DEEPSEEK_TRACE_MAX_BYTES` (по умолчанию 8192 байта) на
+  блок; в записи остаются `originalBytes` и `truncated`, так что усечение видно.
+- Заголовки `authorization`, `x-api-key`, `cookie`, `x-ds-pow-response` не
+  логируются. **Тела запросов и ответов логируются полностью** — файл трассы
+  содержит ваши промпты, поэтому каталог `logs/` добавлен в `.gitignore`.
+- Файл дописывается, а не перезаписывается при перезапуске сервера.
 
 ---
 

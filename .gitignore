@@ -1,6 +1,8 @@
 node_modules/
 .env
 *.log
+# Request traces contain full prompts and answers — never commit.
+logs/
 auth.json
 deepseek-auth.json
 # Aggregate account export holding live tokens/cookies — never commit.
